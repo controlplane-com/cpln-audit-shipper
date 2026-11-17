@@ -1,7 +1,7 @@
 REGISTRY  = ghcr.io/controlplane-com
 COMPONENT = cpln-audit-shipper
 IMAGE     = cpln-build/$(COMPONENT)
-TAG       ?= v1.0.0
+TAG       ?= v1.1.1
 ORG       ?=
 
 .PHONY: test build push-image cpln-image

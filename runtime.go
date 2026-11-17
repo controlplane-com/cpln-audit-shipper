@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
@@ -147,19 +148,19 @@ func acquireLock(ctx context.Context, cfg *config.Config, hb *heartbeat, log *sl
 }
 
 // mintKey adds this replica's service account key, retrying for a few minutes: on install, the template's service
-// account can be created after the workload has started.
+// account can be created after the workload has started. The heartbeat stays fresh while it waits.
 func mintKey(ctx context.Context, m *sakey.Minter, hb *heartbeat, log *slog.Logger) (*sakey.Key, error) {
 	const waiting = "service-account-wait"
 	defer hb.remove(waiting)
 	deadline := time.Now().Add(5 * time.Minute)
 	for {
+		hb.touch(waiting, log)
 		key, err := m.Mint(ctx)
 		if err == nil || ctx.Err() != nil || time.Now().After(deadline) {
 			return key, err
 		}
-		hb.touch(waiting, log)
 		log.Warn("cannot add a key to the service account yet; retrying", "error", err.Error())
-		if err := backoff.Sleep(ctx, 15*time.Second); err != nil {
+		if err := backoff.Sleep(ctx, 10*time.Second+rand.N(10*time.Second)); err != nil {
 			return nil, err
 		}
 	}

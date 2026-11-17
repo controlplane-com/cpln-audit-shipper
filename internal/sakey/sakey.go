@@ -1,6 +1,6 @@
 // Package sakey gives each replica a key of the release's own service account: it adds one at startup, through the
-// Control Plane API with the workload's token, and removes it when the replica stops. Keys left by replicas that
-// crashed are removed by a later start in the same location.
+// Control Plane API with the workload's token, and removes it when the replica stops. A location runs one replica,
+// so a starting replica first removes the keys its location's earlier replicas left.
 package sakey
 
 import (
@@ -10,12 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"path"
 	"strings"
 	"time"
 
+	"github.com/controlplane-com/cpln-audit-shipper/internal/backoff"
 	"github.com/controlplane-com/cpln-audit-shipper/internal/httpx"
 )
 
@@ -25,41 +27,46 @@ type Config struct {
 	Token    string
 	Org      string
 	Name     string
-	// Location keeps the keys of replicas in different locations apart; Host tells the replicas of one apart.
+	// Location keeps the keys of replicas in different locations apart; Host tells one replica's key from the next.
 	Location string
 	Host     string
-	// StaleAfter is how old a key of this location must be before a starting replica removes it. It must outlast
-	// the overlap of an old and a new replica during a rollout.
-	StaleAfter time.Duration
-	HTTP       *http.Client
-	Logger     *slog.Logger
-	Now        func() time.Time
+	HTTP     *http.Client
+	Logger   *slog.Logger
+	Now      func() time.Time
 }
 
-// Key is a key this replica added. Value is the secret; it is only ever held in memory.
+// Key is the key this replica added. It is only ever held in memory.
 type Key struct {
-	Value       string
-	description string
+	Value string
 }
 
 type Minter struct {
 	cfg  Config
 	base string
+	desc string
 	api  *httpx.Client
+	// conflictTries bounds the retries of a write the API rejected because the account changed meanwhile.
+	conflictTries int
+	conflictWait  func() time.Duration
 }
 
 func New(cfg Config) *Minter {
-	if cfg.StaleAfter <= 0 {
-		cfg.StaleAfter = 30 * time.Minute
-	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	return &Minter{
-		cfg:  cfg,
-		base: strings.TrimRight(cfg.Endpoint, "/") + "/org/" + url.PathEscape(cfg.Org) + "/serviceaccount/" + url.PathEscape(cfg.Name),
-		api:  &httpx.Client{Service: "Control Plane API", HTTP: cfg.HTTP, Logger: cfg.Logger, Timeout: 30 * time.Second},
+	m := &Minter{
+		cfg:           cfg,
+		base:          strings.TrimRight(cfg.Endpoint, "/") + "/org/" + url.PathEscape(cfg.Org) + "/serviceaccount/" + url.PathEscape(cfg.Name),
+		api:           &httpx.Client{Service: "Control Plane API", HTTP: cfg.HTTP, Logger: cfg.Logger, Timeout: 30 * time.Second},
+		conflictTries: 5,
+		conflictWait:  func() time.Duration { return time.Second + rand.N(2*time.Second) },
 	}
+	// One description per process, so every key this process adds, including retried ones, is found again.
+	m.desc = fmt.Sprintf("%s%s %s", m.prefix(), cfg.Now().UTC().Format(time.RFC3339), cfg.Host)
+	if len(m.desc) > 250 {
+		m.desc = m.desc[:250]
+	}
+	return m
 }
 
 // prefix starts the description of every key this location's replicas add.
@@ -73,61 +80,55 @@ type listedKey struct {
 	Description string    `json:"description"`
 }
 
-// Mint removes this location's stale keys, then adds a key for this replica.
+// Mint removes the keys this location's earlier replicas left, which are gone or stopping, then adds this replica's.
 func (m *Minter) Mint(ctx context.Context) (*Key, error) {
 	keys, err := m.list(ctx)
 	if err != nil {
 		return nil, err
 	}
-	cut := m.cfg.Now().Add(-m.cfg.StaleAfter)
-	if err := m.drop(ctx, m.ours(keys, func(k listedKey) bool { return k.Created.Before(cut) })); err != nil {
+	var stale []string
+	for _, k := range keys {
+		if strings.HasPrefix(k.Description, m.prefix()) {
+			stale = append(stale, k.Name)
+		}
+	}
+	if err := m.drop(ctx, stale); err != nil {
 		return nil, err
 	}
-	desc := fmt.Sprintf("%s%s %s", m.prefix(), m.cfg.Now().UTC().Format(time.RFC3339), m.cfg.Host)
-	if len(desc) > 250 {
-		desc = desc[:250]
-	}
-	value, err := m.add(ctx, desc)
-	var se *httpx.StatusError
-	if errors.As(err, &se) && se.Status == http.StatusBadRequest && strings.Contains(se.Message, "keys") {
-		// The account is full: this location's earlier keys belong to replicas that are gone or about to stop.
-		if keys, err = m.list(ctx); err != nil {
-			return nil, err
-		}
-		if err := m.drop(ctx, m.ours(keys, func(listedKey) bool { return true })); err != nil {
-			return nil, err
-		}
-		value, err = m.add(ctx, desc)
-	}
+	value, err := m.add(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return &Key{Value: value, description: desc}, nil
+	return &Key{Value: value}, nil
 }
 
-// Remove drops the key this replica added. A retried add can leave two keys with its description; both go.
-func (m *Minter) Remove(ctx context.Context, k *Key) error {
+// Present reports whether this replica's key still exists.
+func (m *Minter) Present(ctx context.Context) (bool, error) {
+	keys, err := m.list(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, k := range keys {
+		if k.Description == m.desc {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// Remove drops every key this replica added.
+func (m *Minter) Remove(ctx context.Context) error {
 	keys, err := m.list(ctx)
 	if err != nil {
 		return err
 	}
 	var names []string
-	for _, l := range keys {
-		if l.Description == k.description {
-			names = append(names, l.Name)
-		}
-	}
-	return m.drop(ctx, names)
-}
-
-func (m *Minter) ours(keys []listedKey, match func(listedKey) bool) []string {
-	var names []string
 	for _, k := range keys {
-		if strings.HasPrefix(k.Description, m.prefix()) && match(k) {
+		if k.Description == m.desc {
 			names = append(names, k.Name)
 		}
 	}
-	return names
+	return m.drop(ctx, names)
 }
 
 func (m *Minter) list(ctx context.Context) ([]listedKey, error) {
@@ -144,8 +145,13 @@ func (m *Minter) list(ctx context.Context) ([]listedKey, error) {
 	return sa.Keys, nil
 }
 
-func (m *Minter) add(ctx context.Context, desc string) (string, error) {
-	body, err := m.call(ctx, http.MethodPost, m.base+"/-addKey", map[string]string{"description": desc})
+func (m *Minter) add(ctx context.Context) (string, error) {
+	var body []byte
+	err := m.retryConflicts(ctx, func() error {
+		var err error
+		body, err = m.call(ctx, http.MethodPost, m.base+"/-addKey", map[string]string{"description": m.desc})
+		return err
+	})
 	if err != nil {
 		return "", fmt.Errorf("adding a key to service account %s: %w", m.cfg.Name, err)
 	}
@@ -162,13 +168,34 @@ func (m *Minter) drop(ctx context.Context, names []string) error {
 	if len(names) == 0 {
 		return nil
 	}
-	if _, err := m.call(ctx, http.MethodPatch, m.base, map[string][]string{"$drop/keys": names}); err != nil {
+	err := m.retryConflicts(ctx, func() error {
+		_, err := m.call(ctx, http.MethodPatch, m.base, map[string][]string{"$drop/keys": names})
+		return err
+	})
+	if err != nil {
 		return fmt.Errorf("removing %d key(s) from service account %s: %w", len(names), m.cfg.Name, err)
 	}
 	if m.cfg.Logger != nil {
 		m.cfg.Logger.Info("removed service account keys", "service_account", m.cfg.Name, "keys", len(names))
 	}
 	return nil
+}
+
+// retryConflicts retries a write the API rejected because the account changed meanwhile (409), or reported as full
+// while another replica was writing it (400; its retry can count stale keys).
+func (m *Minter) retryConflicts(ctx context.Context, write func() error) error {
+	for try := 1; ; try++ {
+		err := write()
+		var se *httpx.StatusError
+		retry := errors.As(err, &se) && (se.Status == http.StatusConflict ||
+			se.Status == http.StatusBadRequest && strings.Contains(se.Message, "keys"))
+		if !retry || try >= m.conflictTries {
+			return err
+		}
+		if err := backoff.Sleep(ctx, m.conflictWait()); err != nil {
+			return err
+		}
+	}
 }
 
 func (m *Minter) call(ctx context.Context, method, target string, payload any) ([]byte, error) {

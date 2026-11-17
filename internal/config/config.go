@@ -316,7 +316,7 @@ func FromEnv(get func(string) string) (*Config, error) {
 
 		LeaseTTL:        p.duration("LEASE_TTL", "5m"),
 		CycleBudget:     p.duration("CYCLE_BUDGET", "30m"),
-		DrainTimeout:    p.duration("DRAIN_TIMEOUT", "60s"),
+		DrainTimeout:    p.duration("DRAIN_TIMEOUT", "30s"),
 		MaxBatchEvents:  p.integer("MAX_BATCH_EVENTS", 10000, 1, 1000000),
 		MaxBatchBytes:   p.integer("MAX_BATCH_BYTES", 32<<20, 1<<20, 1<<30),
 		HeartbeatDir:    p.str("HEARTBEAT_DIR", "/tmp/heartbeat"),
