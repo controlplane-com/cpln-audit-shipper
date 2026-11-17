@@ -27,7 +27,7 @@ Everything is read from environment variables; the template sets them. Invalid s
 
 | Variable | Default | |
 |---|---|---|
-| `SERVICE_ACCOUNT_NAME` | one of these two | A service account with `readAudit` on the audit contexts and, for Kubernetes audit logs, `readLogs` on the org. Each replica adds a key of its own to it at startup, through the Control Plane API with the workload's `CPLN_TOKEN` (the identity needs `addKey`, `edit` and `view` on the service account), keeps the key in memory only, and removes it when it stops. A starting replica removes keys its location left more than 30 minutes ago, after a crash. A service account holds at most 10 keys. |
+| `SERVICE_ACCOUNT_NAME` | one of these two | A service account with `readAudit` on the audit contexts and, for Kubernetes audit logs, `readLogs` on the org. Each replica adds a key of its own to it at startup, through the Control Plane API with the workload's `CPLN_TOKEN` (the identity needs `addKey`, `edit` and `view` on the service account), keeps the key in memory only, and removes it as soon as it is told to stop. A location runs one replica, so a starting replica first removes the keys its location's earlier replicas left; the account then holds about one key per location (at most 10). A replica whose key disappears restarts to add a new one. |
 | `SERVICE_ACCOUNT_KEY` | one of these two | A key of such a service account, for example from a secret. The audit and logs APIs do not accept a workload's own `CPLN_TOKEN`, so one of the two is needed. |
 | `STREAM` | `default` | Names this export; part of every checkpoint and object name |
 | `INTERVAL` | `5m` | Time between the starts of two cycles of each stream (10s to 24h) |
@@ -55,7 +55,7 @@ Everything is read from environment variables; the template sets them. Invalid s
 | `AWS_AUTH_MODE` | | `identity` (default credential chain) or `secret` |
 | `AWS_SOURCE_ACCESS_KEY_ID`, `AWS_SOURCE_SECRET_ACCESS_KEY`, `AWS_SOURCE_SESSION_TOKEN` | | With `secret` |
 | `AWS_ASSUME_ROLE_ARN`, `AWS_ASSUME_ROLE_EXTERNAL_ID`, `AWS_ASSUME_ROLE_SESSION_NAME`, `AWS_ASSUME_ROLE_DURATION` | session `cpln-audit-shipper`, `1h` | Optional role to assume with the keys |
-| `LEASE_TTL`, `CYCLE_BUDGET`, `DRAIN_TIMEOUT` | `5m`, `30m`, `60s` | |
+| `LEASE_TTL`, `CYCLE_BUDGET`, `DRAIN_TIMEOUT` | `5m`, `30m`, `30s` | After SIGTERM, a delivery under way gets `DRAIN_TIMEOUT` to finish. The platform's default preStop hook waits half the termination grace period before SIGTERM, so keep `DRAIN_TIMEOUT` plus 15s within the other half. |
 | `MAX_BATCH_EVENTS`, `MAX_BATCH_BYTES` | `10000`, 32 MiB | |
 | `HEARTBEAT_DIR`, `HEARTBEAT_MAX_AGE`, `LOG_LEVEL` | `/tmp/heartbeat`, `30m`, `info` | |
 

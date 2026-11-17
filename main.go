@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -65,6 +66,11 @@ func run() int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+	// restart stops the shipper so the platform starts it again, for example to add a new key after losing its own.
+	ctx, restart := context.WithCancel(ctx)
+	defer restart()
+	var restarting atomic.Bool
+	var onAuthError func()
 
 	owner := fmt.Sprintf("%s/%s/%s", cfg.Location, cfg.Hostname, randomHex(4))
 	log = log.With("replica", owner, "org", cfg.Org, "stream", cfg.Stream)
@@ -126,16 +132,39 @@ func run() int {
 		}
 		log.Info("added a key to the service account", "service_account", cfg.ServiceAccountName)
 		cfg.Key = key.Value
+		// The key is removed as soon as the shipper is told to stop: a delivery that drains after that only writes to
+		// the destination and the checkpoint, never to the source, and the platform's stop window is short.
+		var once sync.Once
+		removeKey := func() {
+			once.Do(func() {
+				rctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				if err := minter.Remove(rctx); err != nil {
+					log.Warn("could not remove this replica's service account key; the next start in this location removes it", "error", err.Error())
+					return
+				}
+				log.Info("removed this replica's service account key")
+			})
+		}
+		stopRemove := context.AfterFunc(ctx, removeKey)
 		defer func() {
-			// The run's context is done by now; removing the key gets a short context of its own.
-			rctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			if err := minter.Remove(rctx, key); err != nil {
-				log.Warn("could not remove this replica's service account key; a later start in this location removes it", "error", err.Error())
+			stopRemove()
+			removeKey()
+		}()
+		var checking atomic.Bool
+		onAuthError = func() {
+			if !checking.CompareAndSwap(false, true) {
 				return
 			}
-			log.Info("removed this replica's service account key")
-		}()
+			defer checking.Store(false)
+			cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			if present, err := minter.Present(cctx); err == nil && !present {
+				log.Error("this replica's service account key was removed; restarting to add a new one")
+				restarting.Store(true)
+				restart()
+			}
+		}
 	}
 
 	sink, err := newSink(cfg, awsCfg, log)
@@ -162,6 +191,9 @@ func run() int {
 		runners = append(runners, r)
 	}
 
+	for _, r := range runners {
+		r.onAuthError = onAuthError
+	}
 	var wg sync.WaitGroup
 	for _, r := range runners {
 		wg.Add(1)
@@ -172,6 +204,9 @@ func run() int {
 	}
 	wg.Wait()
 	log.Info("shipper stopped")
+	if restarting.Load() {
+		return exitFailed
+	}
 	return exitOK
 }
 
@@ -257,6 +292,8 @@ type runner struct {
 	name string
 	beat func()
 	log  *slog.Logger
+	// onAuthError, when set, checks whether a rejected key was this replica's own and is gone.
+	onAuthError func()
 }
 
 func newRunner(pc pipeline.Config, src pipeline.Source, sink pipeline.Sink, state objstore.Store, hb *heartbeat, log *slog.Logger) *runner {
@@ -289,6 +326,10 @@ func (r *runner) loop(ctx context.Context, interval time.Duration) {
 		case err != nil:
 			r.log.Error("cycle failed, the next one resumes from the checkpoint", append(attrs, "error", err.Error(), "hint", failureHint(err, r.kind, r.name))...)
 			wait = max(wait, 10*time.Second)
+			var authErr *httpx.AuthError
+			if r.onAuthError != nil && errors.As(err, &authErr) && (authErr.Service == "audit API" || authErr.Service == "logs API") {
+				r.onAuthError()
+			}
 		case res.Status == pipeline.StatusSkipped:
 			r.log.Info("cycle skipped: another replica holds the checkpoint lease", append(attrs, "lease_owner", res.LeaseOwner)...)
 		case res.Status == pipeline.StatusBudgetExhausted:

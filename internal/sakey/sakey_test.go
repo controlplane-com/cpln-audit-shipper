@@ -25,12 +25,20 @@ type fakeAPI struct {
 	seq   int
 	max   int
 	auths []string
+	// conflicts answers this many writes with 409, as the API does when the account changed meanwhile.
+	conflicts int
 }
 
 func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.auths = append(f.auths, r.Header.Get("Authorization"))
+	if r.Method != http.MethodGet && f.conflicts > 0 {
+		f.conflicts--
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"message":"Conflict: resource was changed"}`))
+		return
+	}
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/org/acme/serviceaccount/r1-audit-shipper":
 		_ = json.NewEncoder(w).Encode(map[string]any{"name": "r1-audit-shipper", "keys": f.keys})
@@ -85,13 +93,14 @@ func newMinter(t *testing.T, f *fakeAPI, location string) *Minter {
 		Location: "/org/acme/location/" + location, Host: "r1-audit-shipper-abc", Now: func() time.Time { return now },
 	})
 	m.api.Backoff = backoff.Policy{Base: time.Millisecond, Max: time.Millisecond, MaxAttempts: 2}
+	m.conflictWait = func() time.Duration { return time.Millisecond }
 	return m
 }
 
-func TestMintRemovesOnlyThisLocationsStaleKeysAndAddsOne(t *testing.T) {
+func TestMintReplacesThisLocationsEarlierKeysOnly(t *testing.T) {
 	f := &fakeAPI{max: 10, keys: []listedKey{
-		{Name: "stale-here", Created: now.Add(-2 * time.Hour), Description: "cpln-audit-shipper aws-us-east-2 2026-11-17T10:00:00Z old"},
-		{Name: "fresh-here", Created: now.Add(-5 * time.Minute), Description: "cpln-audit-shipper aws-us-east-2 2026-11-17T11:55:00Z rolling"},
+		{Name: "earlier-here", Created: now.Add(-2 * time.Hour), Description: "cpln-audit-shipper aws-us-east-2 2026-11-17T10:00:00Z old"},
+		{Name: "crashed-here", Created: now.Add(-time.Minute), Description: "cpln-audit-shipper aws-us-east-2 2026-11-17T11:59:00Z crashed"},
 		{Name: "other-location", Created: now.Add(-48 * time.Hour), Description: "cpln-audit-shipper aws-us-east-1 2026-11-15T12:00:00Z live"},
 		{Name: "someone-elses", Created: now.Add(-48 * time.Hour), Description: "ci pipeline"},
 	}}
@@ -103,14 +112,20 @@ func TestMintRemovesOnlyThisLocationsStaleKeysAndAddsOne(t *testing.T) {
 	if k.Value != "secret-1" {
 		t.Fatalf("key = %q", k.Value)
 	}
-	if got := strings.Join(f.names(), ","); got != "fresh-here,k1,other-location,someone-elses" {
+	if got := strings.Join(f.names(), ","); got != "k1,other-location,someone-elses" {
 		t.Fatalf("keys after mint = %s", got)
 	}
-	if err := m.Remove(context.Background(), k); err != nil {
+	if ok, err := m.Present(context.Background()); err != nil || !ok {
+		t.Fatalf("present = %v, %v", ok, err)
+	}
+	if err := m.Remove(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(f.names(), ","); got != "fresh-here,other-location,someone-elses" {
+	if got := strings.Join(f.names(), ","); got != "other-location,someone-elses" {
 		t.Fatalf("keys after remove = %s", got)
+	}
+	if ok, err := m.Present(context.Background()); err != nil || ok {
+		t.Fatalf("present after remove = %v, %v", ok, err)
 	}
 	for _, a := range f.auths {
 		if a != "w.workload-token" {
@@ -119,18 +134,29 @@ func TestMintRemovesOnlyThisLocationsStaleKeysAndAddsOne(t *testing.T) {
 	}
 }
 
-func TestAFullAccountFreesThisLocationsKeysAndRetries(t *testing.T) {
-	f := &fakeAPI{max: 3, keys: []listedKey{
-		{Name: "crash-1", Created: now.Add(-time.Minute), Description: "cpln-audit-shipper aws-us-east-2 a"},
-		{Name: "crash-2", Created: now.Add(-2 * time.Minute), Description: "cpln-audit-shipper aws-us-east-2 b"},
-		{Name: "other-location", Created: now.Add(-time.Minute), Description: "cpln-audit-shipper aws-us-east-1 c"},
-	}}
-	k, err := newMinter(t, f, "aws-us-east-2").Mint(context.Background())
-	if err != nil {
-		t.Fatal(err)
+func TestRepeatedStartsKeepOneKeyPerLocation(t *testing.T) {
+	f := &fakeAPI{max: 10}
+	for i := 0; i < 25; i++ {
+		if _, err := newMinter(t, f, "aws-us-east-2").Mint(context.Background()); err != nil {
+			t.Fatalf("start %d: %v", i, err)
+		}
+		if _, err := newMinter(t, f, "aws-us-east-1").Mint(context.Background()); err != nil {
+			t.Fatalf("start %d: %v", i, err)
+		}
 	}
-	if got := strings.Join(f.names(), ","); k.Value == "" || got != "k1,other-location" {
-		t.Fatalf("keys after a full account = %s", got)
+	if n := len(f.names()); n != 2 {
+		t.Fatalf("%d keys after 50 crashed starts in two locations, want one per location", n)
+	}
+}
+
+func TestConflictingWritesAreRetried(t *testing.T) {
+	f := &fakeAPI{max: 10, conflicts: 2}
+	m := newMinter(t, f, "aws-us-east-2")
+	if _, err := m.Mint(context.Background()); err != nil {
+		t.Fatalf("mint after two conflicts: %v", err)
+	}
+	if err := m.Remove(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }
 
