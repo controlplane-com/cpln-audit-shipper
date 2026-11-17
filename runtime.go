@@ -19,6 +19,7 @@ import (
 	"github.com/controlplane-com/cpln-audit-shipper/internal/config"
 	"github.com/controlplane-com/cpln-audit-shipper/internal/filestore"
 	"github.com/controlplane-com/cpln-audit-shipper/internal/httpx"
+	"github.com/controlplane-com/cpln-audit-shipper/internal/sakey"
 )
 
 // heartbeat keeps one file per pipeline. The liveness probe fails when any of them is older than the maximum age,
@@ -141,6 +142,25 @@ func acquireLock(ctx context.Context, cfg *config.Config, hb *heartbeat, log *sl
 		default:
 			log.Error("cannot open the state lock", "error", err.Error(), "hint", "the volume must be writable by the container's group (securityOptions.filesystemGroupId)")
 			return nil, exitFailed
+		}
+	}
+}
+
+// mintKey adds this replica's service account key, retrying for a few minutes: on install, the template's service
+// account can be created after the workload has started.
+func mintKey(ctx context.Context, m *sakey.Minter, hb *heartbeat, log *slog.Logger) (*sakey.Key, error) {
+	const waiting = "service-account-wait"
+	defer hb.remove(waiting)
+	deadline := time.Now().Add(5 * time.Minute)
+	for {
+		key, err := m.Mint(ctx)
+		if err == nil || ctx.Err() != nil || time.Now().After(deadline) {
+			return key, err
+		}
+		hb.touch(waiting, log)
+		log.Warn("cannot add a key to the service account yet; retrying", "error", err.Error())
+		if err := backoff.Sleep(ctx, 15*time.Second); err != nil {
+			return nil, err
 		}
 	}
 }

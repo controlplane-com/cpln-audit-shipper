@@ -182,3 +182,25 @@ func TestSeveralAuditContexts(t *testing.T) {
 		t.Fatalf("contexts = %q", c.CplnAudit.Names)
 	}
 }
+
+func TestTheShipperCanAddItsOwnServiceAccountKey(t *testing.T) {
+	c, err := FromEnv(env(map[string]string{
+		"SERVICE_ACCOUNT_KEY": "", "SERVICE_ACCOUNT_NAME": "r1-audit-shipper",
+		"CPLN_ENDPOINT": "http://api.cpln.io", "CPLN_TOKEN": "w.token",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Key != "" || c.ServiceAccountName != "r1-audit-shipper" {
+		t.Fatalf("key %q, service account %q", c.Key, c.ServiceAccountName)
+	}
+	for name, extra := range map[string]map[string]string{
+		"both":          {"SERVICE_ACCOUNT_NAME": "r1-audit-shipper", "CPLN_ENDPOINT": "http://api.cpln.io", "CPLN_TOKEN": "w.token"},
+		"no api access": {"SERVICE_ACCOUNT_KEY": "", "SERVICE_ACCOUNT_NAME": "r1-audit-shipper"},
+		"bad name":      {"SERVICE_ACCOUNT_KEY": "", "SERVICE_ACCOUNT_NAME": "R1 shipper", "CPLN_ENDPOINT": "http://api.cpln.io", "CPLN_TOKEN": "w.token"},
+	} {
+		if _, err := FromEnv(env(extra)); err == nil || !strings.Contains(err.Error(), "SERVICE_ACCOUNT") {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+}

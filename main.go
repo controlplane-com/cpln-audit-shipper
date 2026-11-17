@@ -29,6 +29,7 @@ import (
 	"github.com/controlplane-com/cpln-audit-shipper/internal/objstore"
 	"github.com/controlplane-com/cpln-audit-shipper/internal/pipeline"
 	"github.com/controlplane-com/cpln-audit-shipper/internal/record"
+	"github.com/controlplane-com/cpln-audit-shipper/internal/sakey"
 	"github.com/controlplane-com/cpln-audit-shipper/internal/sink/otlpsink"
 	"github.com/controlplane-com/cpln-audit-shipper/internal/sink/s3sink"
 	"github.com/controlplane-com/cpln-audit-shipper/internal/sink/syslogsink"
@@ -107,6 +108,34 @@ func run() int {
 		}
 		defer lock.Release()
 		state = &filestore.Store{Dir: cfg.StateDir}
+	}
+
+	if cfg.Key == "" {
+		minter := sakey.New(sakey.Config{
+			Endpoint: cfg.CplnEndpoint, Token: cfg.CplnToken, Org: cfg.Org, Name: cfg.ServiceAccountName,
+			Location: cfg.Location, Host: cfg.Hostname, Logger: log,
+		})
+		key, err := mintKey(ctx, minter, hb, log)
+		if err != nil {
+			if ctx.Err() != nil {
+				return exitOK
+			}
+			log.Error("cannot add a key to the service account", "service_account", cfg.ServiceAccountName, "error", err.Error(),
+				"hint", "the workload identity needs addKey, edit and view on the service account (the template grants them), and the account holds at most 10 keys")
+			return exitFailed
+		}
+		log.Info("added a key to the service account", "service_account", cfg.ServiceAccountName)
+		cfg.Key = key.Value
+		defer func() {
+			// The run's context is done by now; removing the key gets a short context of its own.
+			rctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if err := minter.Remove(rctx, key); err != nil {
+				log.Warn("could not remove this replica's service account key; a later start in this location removes it", "error", err.Error())
+				return
+			}
+			log.Info("removed this replica's service account key")
+		}()
 	}
 
 	sink, err := newSink(cfg, awsCfg, log)
@@ -304,9 +333,9 @@ func failureHint(err error, kind, name string) string {
 	var authErr *httpx.AuthError
 	switch {
 	case errors.As(err, &authErr) && authErr.Service == "logs API":
-		return "the service account whose key is in the key secret needs readLogs on the org"
+		return "the service account needs readLogs on the org"
 	case errors.As(err, &authErr) && authErr.Service == "audit API":
-		return fmt.Sprintf("the service account whose key is in the key secret needs readAudit on auditctx/%s", name)
+		return fmt.Sprintf("the service account needs readAudit on auditctx/%s, and its key must still exist", name)
 	case errors.As(err, &authErr):
 		return "the sink rejected the credentials; check the OTLP auth header secret"
 	case errors.Is(err, objstore.ErrAccessDenied):

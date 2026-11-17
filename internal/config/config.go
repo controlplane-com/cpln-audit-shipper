@@ -50,8 +50,10 @@ type Config struct {
 	// CplnToken and CplnEndpoint are the workload's own API access, used to read its GVC.
 	CplnToken    string
 	CplnEndpoint string
-	// Key is the service account key the audit and logs APIs accept.
-	Key string
+	// Key is the service account key the audit and logs APIs accept. With ServiceAccountName instead, the shipper
+	// adds a key of its own to that service account at startup and removes it when it stops.
+	Key                string
+	ServiceAccountName string
 
 	Stream   string
 	Interval time.Duration
@@ -285,15 +287,16 @@ func (p *parser) checkBucket(prefix string, b Bucket) {
 func FromEnv(get func(string) string) (*Config, error) {
 	p := &parser{get: get}
 	c := &Config{
-		Org:          p.str("CPLN_ORG", ""),
-		GVC:          p.str("CPLN_GVC", ""),
-		Location:     p.str("CPLN_LOCATION", "unknown"),
-		Hostname:     p.str("HOSTNAME", "local"),
-		CplnToken:    p.secret("CPLN_TOKEN"),
-		CplnEndpoint: p.str("CPLN_ENDPOINT", ""),
-		Key:          p.secret("SERVICE_ACCOUNT_KEY"),
-		Stream:       p.str("STREAM", "default"),
-		Interval:     p.duration("INTERVAL", "5m"),
+		Org:                p.str("CPLN_ORG", ""),
+		GVC:                p.str("CPLN_GVC", ""),
+		Location:           p.str("CPLN_LOCATION", "unknown"),
+		Hostname:           p.str("HOSTNAME", "local"),
+		CplnToken:          p.secret("CPLN_TOKEN"),
+		CplnEndpoint:       p.str("CPLN_ENDPOINT", ""),
+		Key:                p.secret("SERVICE_ACCOUNT_KEY"),
+		ServiceAccountName: p.str("SERVICE_ACCOUNT_NAME", ""),
+		Stream:             p.str("STREAM", "default"),
+		Interval:           p.duration("INTERVAL", "5m"),
 
 		CplnAudit: p.source("AUDIT_", sourceDefaults{
 			enabled: true, namesKey: "CONTEXTS", names: "cpln", re: contextRE, what: "an audit context name",
@@ -349,8 +352,18 @@ func FromEnv(get func(string) string) (*Config, error) {
 			p.fail("LOGS_ENDPOINT: %q must be an http(s) URL", c.LogsEndpoint)
 		}
 	}
-	if c.Key == "" {
-		p.fail("SERVICE_ACCOUNT_KEY is not set: it must hold a key of a service account that may read the audit contexts or logs (the audit and logs APIs do not accept the workload's CPLN_TOKEN)")
+	switch {
+	case c.Key != "" && c.ServiceAccountName != "":
+		p.fail("set SERVICE_ACCOUNT_KEY or SERVICE_ACCOUNT_NAME, not both")
+	case c.Key == "" && c.ServiceAccountName == "":
+		p.fail("SERVICE_ACCOUNT_NAME (a service account the shipper adds its own key to) or SERVICE_ACCOUNT_KEY (a key of a service account) is required: the audit and logs APIs do not accept the workload's CPLN_TOKEN")
+	case c.ServiceAccountName != "":
+		if !nameRE.MatchString(c.ServiceAccountName) {
+			p.fail("SERVICE_ACCOUNT_NAME: %q is not a service account name", c.ServiceAccountName)
+		}
+		if c.CplnEndpoint == "" || c.CplnToken == "" {
+			p.fail("SERVICE_ACCOUNT_NAME needs CPLN_ENDPOINT and CPLN_TOKEN, which Control Plane sets in every workload")
+		}
 	}
 	if c.LeaseTTL < time.Minute {
 		p.fail("LEASE_TTL must be at least 1m")
