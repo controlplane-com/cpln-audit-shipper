@@ -27,7 +27,8 @@ Everything is read from environment variables; the template sets them. Invalid s
 
 | Variable | Default | |
 |---|---|---|
-| `SERVICE_ACCOUNT_KEY` | required | Key of a service account with `readAudit` on the audit contexts and, for Kubernetes audit logs, `readLogs` on the org. A workload's own `CPLN_TOKEN` is not accepted by these APIs. |
+| `SERVICE_ACCOUNT_NAME` | one of these two | A service account with `readAudit` on the audit contexts and, for Kubernetes audit logs, `readLogs` on the org. Each replica adds a key of its own to it at startup, through the Control Plane API with the workload's `CPLN_TOKEN` (the identity needs `addKey`, `edit` and `view` on the service account), keeps the key in memory only, and removes it when it stops. A starting replica removes keys its location left more than 30 minutes ago, after a crash. A service account holds at most 10 keys. |
+| `SERVICE_ACCOUNT_KEY` | one of these two | A key of such a service account, for example from a secret. The audit and logs APIs do not accept a workload's own `CPLN_TOKEN`, so one of the two is needed. |
 | `STREAM` | `default` | Names this export; part of every checkpoint and object name |
 | `INTERVAL` | `5m` | Time between the starts of two cycles of each stream (10s to 24h) |
 | `AUDIT_ENABLED` | `true` | The Control Plane audit trail |
@@ -66,6 +67,7 @@ Everything is read from environment variables; the template sets them. Invalid s
 |---|---|
 | `main.go` | Wiring, one loop per pipeline, signal handling, exit codes |
 | `runtime.go` | Heartbeats and `healthcheck`, the memory limit, the single-location check and lock for volume set state |
+| `internal/sakey` | Adds this replica's key to the service account at startup and removes it on stop |
 | `internal/pipeline` | The core: checkpoint, lease, windowing, batching, commit order |
 | `internal/auditapi`, `internal/lokiapi` | Sources |
 | `internal/sink/s3sink`, `syslogsink`, `otlpsink` | Sinks |
