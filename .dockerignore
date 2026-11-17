@@ -1,0 +1,6 @@
+bin/
+.git
+.github
+.claude
+.DS_Store
+*.md
