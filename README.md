@@ -86,4 +86,4 @@ To try a build in an org before a release: `make cpln-image ORG=my-org TAG=v1.0.
 
 ## Release
 
-Push a tag such as `v1.0.0`. The `Publish Docker Image` workflow tests and pushes `ghcr.io/controlplane-com/cpln-build/cpln-audit-shipper:v1.0.0` for linux/amd64 and linux/arm64. Then point the template's `image` at the new tag in a new template version.
+Push a tag such as `v1.0.0`. The `Publish Docker Image` workflow tests and pushes `ghcr.io/controlplane-com/cpln-build/cpln-audit-shipper:v1.0.0` for linux/amd64 and linux/arm64. Then point the template's `image` at the new tag and its index digest (`ghcr.io/…/cpln-audit-shipper:vX.Y.Z@sha256:…`) in a new template version. `v*` tags are protected: a released tag cannot be moved or deleted.
